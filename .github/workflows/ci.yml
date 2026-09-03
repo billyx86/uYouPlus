@@ -1,0 +1,111 @@
+# Validation-only CI.
+#
+# The real build pipeline (buildapp.yml) needs a macOS runner, Theos, the
+# iOS SDK and a decrypted YouTube IPA, so it stays manual-dispatch. This
+# workflow runs on a cheap ubuntu runner on every push/PR and does the
+# metadata/structure checks that don't need that toolchain, so a broken
+# control file, an invalid workflow YAML, or a deleted source can't slip
+# through. All checks use tools preinstalled on ubuntu-latest (python3 +
+# PyYAML) - no dependencies to install.
+
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Metadata + structure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate workflow YAML
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, sys
+          import yaml
+
+          files = sorted(glob.glob(".github/workflows/*.yml"))
+          if not files:
+              print("::error::No workflow files found")
+              sys.exit(1)
+          for f in files:
+              with open(f, encoding="utf-8") as fh:
+                  data = yaml.safe_load(fh)
+              if not isinstance(data, dict) or "name" not in data:
+                  print("::error::Workflow missing a top-level 'name':", f)
+                  sys.exit(1)
+              print("OK", f)
+          print("All workflow files are valid YAML")
+          PY
+
+      - name: Validate dpkg control file
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, sys
+
+          text = open("control", encoding="utf-8").read()
+          fields = {}
+          for line in text.splitlines():
+              if not line.strip() or line.startswith((" ", "\t")):
+                  continue  # continuation lines (wrapping Description)
+              if ":" in line:
+                  key, _, val = line.partition(":")
+                  fields[key.strip()] = val.strip()
+
+          # Fields that must be present in a dpkg control file.
+          # (Version is injected by theos at package time, so it is NOT
+          # expected in the source control file.)
+          required = ["Package", "Name", "Architecture", "Maintainer", "Description"]
+          missing = [k for k in required if k not in fields or not fields[k]]
+          if missing:
+              print("::error::control is missing required field(s):", ", ".join(missing))
+              sys.exit(1)
+
+          # Package name must be lowercase dot-separated and look sane.
+          if not re.fullmatch(r"[a-z0-9][a-z0-9.\-]*", fields["Package"]):
+              print("::error::control 'Package' looks invalid:", fields["Package"])
+              sys.exit(1)
+
+          # Architecture must be a known-ish token.
+          if not re.fullmatch(r"[a-z0-9\-]+", fields["Architecture"]):
+              print("::error::control 'Architecture' looks invalid:", fields["Architecture"])
+              sys.exit(1)
+
+          print("control OK — Package:", fields["Package"], "Arch:", fields["Architecture"])
+          PY
+
+      - name: Validate repo structure
+        run: |
+          set -euo pipefail
+          # Files / globs the build relies on must exist.
+          for path in Makefile build.sh control uYouPlus.plist; do
+            if [[ ! -f "$path" ]]; then
+              echo "::error::Missing required file: $path"
+              exit 1
+            fi
+          done
+          # At least one tweak source must exist (Makefile compiles Sources/*.{xm,x}).
+          srcs=$(find Sources -type f \( -name '*.xm' -o -name '*.x' \) 2>/dev/null || true)
+          if [[ -z "$srcs" ]]; then
+            echo "::error::No tweak sources found under Sources/ (*.xm / *.x)"
+            exit 1
+          fi
+          echo "Found tweak sources:"
+          echo "$srcs"
+          # The tweak plist must be non-empty.
+          if [[ ! -s uYouPlus.plist ]]; then
+            echo "::error::uYouPlus.plist is empty"
+            exit 1
+          fi
+          echo "Structure OK"
